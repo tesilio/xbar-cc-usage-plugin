@@ -1,0 +1,13 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OMC state (session-specific)
+.omc/
+
+# Claude local settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store
