@@ -16,6 +16,39 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
 USAGE_API_URL="https://api.anthropic.com/api/oauth/usage"
 
+# Extract OAuth Client ID from Claude Code installation
+get_oauth_client_id() {
+    # 1. Environment variable (same as Claude Code)
+    if [ -n "$CLAUDE_CODE_OAUTH_CLIENT_ID" ]; then
+        echo "$CLAUDE_CODE_OAUTH_CLIENT_ID"
+        return 0
+    fi
+
+    # 2. Extract from Claude Code binary
+    local claude_path
+    claude_path=$(which claude 2>/dev/null)
+    if [ -n "$claude_path" ]; then
+        if [ -L "$claude_path" ]; then
+            claude_path=$(readlink "$claude_path")
+        fi
+        if [ -f "$claude_path" ]; then
+            local client_id
+            client_id=$(strings "$claude_path" 2>/dev/null | grep -o 'CLIENT_ID:"[0-9a-f-]*"' | head -1 | sed 's/CLIENT_ID:"//;s/"//')
+            if [ -n "$client_id" ]; then
+                echo "$client_id"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+OAUTH_CLIENT_ID=$(get_oauth_client_id)
+if [ -z "$OAUTH_CLIENT_ID" ]; then
+    show_error "Claude Code not found. Install Claude Code first."
+fi
+
 # Refresh interval (configurable in xbar settings)
 REFRESH_INTERVAL=${REFRESH_INTERVAL:-30}
 
@@ -143,6 +176,35 @@ get_access_token() {
 
         # Try to refresh if expires within 5 minutes
         local buffer_ms=$((5 * 60 * 1000))
+        local token_expired=false
+        if [ -n "$expires_at" ] && [ "$expires_at" != "null" ] && [ "$((expires_at - buffer_ms))" -lt "$now_ms" ]; then
+            token_expired=true
+            if [ -n "$refresh_token" ] && [ "$refresh_token" != "null" ]; then
+                local new_token=$(refresh_access_token "$refresh_token")
+                if [ -n "$new_token" ]; then
+                    echo "$new_token"
+                    return 0
+                fi
+            fi
+        fi
+
+        # Don't return expired token - fall through to file fallback
+        if [ "$token_expired" = false ] && [ -n "$token" ] && [ "$token" != "null" ]; then
+            echo "$token"
+            return 0
+        fi
+    fi
+
+    # 2. File fallback
+    local cred_file="$HOME/.claude/.credentials.json"
+    if [ -f "$cred_file" ]; then
+        local token=$(jq -r '.claudeAiOauth.accessToken // .accessToken // empty' "$cred_file")
+        local refresh_token=$(jq -r '.claudeAiOauth.refreshToken // empty' "$cred_file")
+        local expires_at=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred_file")
+        local now_ms=$(($(date +%s) * 1000))
+        local buffer_ms=$((5 * 60 * 1000))
+
+        # Try refresh if file token is also near expiry
         if [ -n "$expires_at" ] && [ "$expires_at" != "null" ] && [ "$((expires_at - buffer_ms))" -lt "$now_ms" ]; then
             if [ -n "$refresh_token" ] && [ "$refresh_token" != "null" ]; then
                 local new_token=$(refresh_access_token "$refresh_token")
@@ -153,17 +215,6 @@ get_access_token() {
             fi
         fi
 
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            echo "$token"
-            return 0
-        fi
-    fi
-
-    # 2. File fallback
-    local cred_file="$HOME/.claude/.credentials.json"
-    if [ -f "$cred_file" ]; then
-        # Prefer claudeAiOauth.accessToken, fallback to root accessToken
-        local token=$(jq -r '.claudeAiOauth.accessToken // .accessToken // empty' "$cred_file")
         if [ -n "$token" ] && [ "$token" != "null" ]; then
             echo "$token"
             return 0
@@ -321,6 +372,7 @@ else
 
     # Retry after token refresh on 401 error
     if [ "$HTTP_CODE" = "401" ]; then
+        # 1st: Try Keychain refresh token
         KEYCHAIN_RAW=$(/usr/bin/security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
         KEYCHAIN_JSON=$(decode_keychain_value "$KEYCHAIN_RAW")
         REFRESH_TOKEN=$(echo "$KEYCHAIN_JSON" | jq -r '.claudeAiOauth.refreshToken // empty' 2>/dev/null)
@@ -332,6 +384,32 @@ else
                 RESPONSE=$(call_usage_api "$ACCESS_TOKEN")
                 HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
                 BODY=$(echo "$RESPONSE" | sed '$d')
+            fi
+        fi
+
+        # 2nd: If still 401, try file fallback
+        if [ "$HTTP_CODE" = "401" ]; then
+            CRED_FILE="$HOME/.claude/.credentials.json"
+            if [ -f "$CRED_FILE" ]; then
+                FILE_REFRESH=$(jq -r '.claudeAiOauth.refreshToken // empty' "$CRED_FILE")
+                if [ -n "$FILE_REFRESH" ] && [ "$FILE_REFRESH" != "$REFRESH_TOKEN" ]; then
+                    NEW_TOKEN=$(refresh_access_token "$FILE_REFRESH")
+                    if [ -n "$NEW_TOKEN" ]; then
+                        ACCESS_TOKEN="$NEW_TOKEN"
+                        RESPONSE=$(call_usage_api "$ACCESS_TOKEN")
+                        HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+                        BODY=$(echo "$RESPONSE" | sed '$d')
+                    fi
+                fi
+                # If refresh failed, try file access token directly
+                if [ "$HTTP_CODE" = "401" ]; then
+                    FILE_TOKEN=$(jq -r '.claudeAiOauth.accessToken // .accessToken // empty' "$CRED_FILE")
+                    if [ -n "$FILE_TOKEN" ] && [ "$FILE_TOKEN" != "$ACCESS_TOKEN" ]; then
+                        RESPONSE=$(call_usage_api "$FILE_TOKEN")
+                        HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+                        BODY=$(echo "$RESPONSE" | sed '$d')
+                    fi
+                fi
             fi
         fi
     fi
